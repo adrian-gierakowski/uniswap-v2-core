@@ -7,6 +7,11 @@ import { expandTo18Decimals, mineBlock, encodePrice } from './shared/utilities'
 import { pairFixture } from './shared/fixtures'
 import { AddressZero } from 'ethers/constants'
 
+import * as R from 'ramda'
+import BNjs from 'bignumber.js'
+
+BNjs.config({ DECIMAL_PLACES: 50 })
+
 const MINIMUM_LIQUIDITY = bigNumberify(0)
 
 chai.use(solidity)
@@ -67,6 +72,373 @@ describe('UniswapV2Pair', () => {
     await token1.transfer(pair.address, token1Amount)
     await pair.mint(wallet.address, overrides)
   }
+
+  const logAsString = (...agrs: Array<any>) => (x: any) => console.log(...agrs, R.toString(x))
+
+  const logState = async (label: string = ''): Promise<{ reserves: Reserves, totalSupply: BigNumber, ratio: BNjs }> => {
+    label = label !== '' ? `${label}: ` : label
+
+    const reserves = R.map(bigNumberify, R.take(2, (await pair.getReserves())))
+    const [x, y] = reserves
+    logAsString(label + 'x:           ')(reserves[0])
+    logAsString(label + 'y:           ')(reserves[1])
+    const totalSupply = await pair.totalSupply()
+    console.log(label + 'totalSupply: ', totalSupply.toString())
+    const ratio = getRatio(reserves)
+    console.log(label + 'ratio:       ', ratio.toString())
+    return { reserves: { x, y }, totalSupply, ratio }
+  }
+
+  const toBNjs = (value: any) => new BNjs(value.toString())
+
+  const BNjstoBigNumber = (rounding: BNjs.RoundingMode = BNjs.ROUND_DOWN) => (x: any) => bigNumberify(x
+    .integerValue(rounding)
+    .toString()
+  )
+
+  function getDY(deltaX: BigNumber | BNjs, {x, y}: Reserves): BNjs {
+    const alpha = toBNjs(deltaX).div(toBNjs(x))
+    return alpha
+      .times(toBNjs(y))
+      .div(alpha.plus(1))
+  }
+
+  const getRatio = (reserves: Array<BigNumber>) => toBNjs(reserves[0]).div(toBNjs(reserves[1]))
+
+  const addLiquidityX = async (x: BigNumber, { ratio }: { ratio: BNjs }) => {
+    const yString = toBNjs(x).div(ratio).integerValue(BNjs.ROUND_DOWN).toString()
+    const y = bigNumberify(yString)
+
+    logAsString('addLiquidity')({ x, y })
+    await addLiquidity(x, y)
+
+    // Deltas of user balances
+    return { dX: x.mul(-1), dY: y.mul(-1) }
+  }
+
+
+  type Reserves = {
+    x: BigNumber,
+    y: BigNumber
+  }
+
+  /**
+    This is derived from following 2 equations:
+    1. x × y = (x + ∆x) × (y − ∆y)
+    2. targetRatio = (x + ∆x) / (y − ∆y)
+
+    which when combined, give:
+    x × y × R = (x + ∆x)²
+
+    and finally:
+
+    ∆x = sqrt(x × y × R) - x
+
+    or (due to (x + ∆x)² and the right side above):
+
+    ∆x = -(sqrt(x × y × R) + x)
+  **/
+  const getDXforTargetRatio = (
+    targetRatio: BNjs,
+    { reserves }: { reserves: Reserves }
+  ) => {
+    logAsString('targetRatio:')(targetRatio)
+    const { x, y } = reserves
+    logAsString('x:')(x)
+    logAsString('y:')(y)
+
+    const sqrtXYR = toBNjs(x)
+      .times(toBNjs(y))
+      .times(targetRatio)
+      .sqrt()
+    const dX = sqrtXYR.minus(toBNjs(x))
+    // logAsString('dX')(dX)
+
+    const isInRange = dX.isLessThanOrEqualTo(toBNjs(x))
+
+    // dX cannot be greater than x since reserves cannot be negative, so
+    // if dX is not in range, we choose the 2nd option mentioned in the comment
+    // above.
+    return isInRange
+      ? dX
+      : sqrtXYR.plus(toBNjs(x)).times(-1)
+  }
+
+  const getDXDYforTargetRatio = (
+    targetRatio: BNjs,
+    { reserves }: { reserves: Reserves }
+  ) => {
+    const dX = getDXforTargetRatio(targetRatio, { reserves })
+    const dY = getDY(dX, reserves)
+    return { dX, dY }
+  }
+
+  const swap = async ({ dX, dY }: { dX: BNjs, dY: BNjs }) => {
+    const makeTokenData = (token: any, amount: any) => ({
+      token,
+      amount: amount.abs()
+    })
+    const x = makeTokenData(token0, dX)
+    const y = makeTokenData(token1, dY)
+
+    const withdrawingX = dX.isLessThan(0)
+
+    // console.log('withdrawingX', withdrawingX)
+
+    const [inData, outData] = withdrawingX
+      ? [y, x]
+      : [x, y]
+
+
+    // logAsString('inData.amount:')(inData.amount)
+    // logAsString('outData.amount:')(outData.amount)
+
+    // TODO: not sure about the rounding modes here
+    const inAmount = BNjstoBigNumber(BNjs.ROUND_DOWN)(inData.amount)
+    const outAmount = BNjstoBigNumber(BNjs.ROUND_DOWN)(outData.amount)
+
+    // logAsString('inAmount:')(inAmount)
+    // logAsString('outAmount:')(outAmount)
+    await inData.token.transfer(pair.address, inAmount)
+
+    await expect(pair.swap(
+      inData.token === token0 ? 0 : outAmount,
+      inData.token === token0 ? outAmount : 0,
+      wallet.address,
+      '0x',
+      overrides
+    ))
+      .to.emit(outData.token, 'Transfer')
+      .withArgs(pair.address, wallet.address, outAmount)
+
+    // Return deltas of user balances
+    return R.zipObj(
+      withdrawingX
+        ? ['dX', 'dY']
+        : ['dY', 'dX'],
+      [outAmount, inAmount.mul(-1)]
+    )
+  }
+
+  const burn = async (burnedLiquidity: BigNumber) => {
+    console.log('== BURN ==')
+    await pair.transfer(pair.address, burnedLiquidity)
+    const res = await (await pair.burn(wallet.address, overrides)).wait()
+
+    const dX = res.events[1].args.value
+    const dY = res.events[2].args.value
+    return { dX, dY }
+  }
+
+  const reduceDeltas = R.reduce(
+    (acc, { dY, dX }) => ({
+      dY: acc.dY.add(dY),
+      dX: acc.dX.add(dX),
+    }),
+    { dY: bigNumberify(0) ,dX: bigNumberify(0) }
+  )
+
+  const prepStateForSyncWithBurn = async () => {
+    const tokenXAmount = expandTo18Decimals(2)
+    const tokenYAmount = expandTo18Decimals(200)
+
+    await addLiquidity(tokenXAmount, tokenYAmount)
+
+    const initialState = await logState('initialState')
+
+    const tokenXAmountExtra = expandTo18Decimals(2)
+    await addLiquidityX(tokenXAmountExtra, initialState)
+
+    const stateAfterAdd = await logState('stateAfterAdd')
+
+    const tokenXAmountSwap = expandTo18Decimals(1)
+    const swapDeltas = await swap({
+      dX: toBNjs(tokenXAmountSwap),
+      dY: getDY(tokenXAmountSwap, stateAfterAdd.reserves)
+    })
+
+    const stateAfterAddAndSwap = await logState('stateAfterAddAndSwap')
+
+    return { initialState, stateAfterAddAndSwap }
+  }
+
+  it.only('sync state with burn and swap', async () => {
+    const { initialState, stateAfterAddAndSwap } = await prepStateForSyncWithBurn()
+
+    // burn to reach initial totalSupply of liquidity tokens
+    const liquidityToBurn = stateAfterAddAndSwap.totalSupply.sub(initialState.totalSupply)
+    logAsString('liquidityToBurn')(liquidityToBurn)
+    const burnDeltas = await burn(liquidityToBurn)
+    const stateAfterBurn = await logState('stateAfterBurn')
+
+    // swap to reach the initial ratio
+    const deltasNeededToSyncRatio = getDXDYforTargetRatio(initialState.ratio, stateAfterBurn)
+    logAsString('deltasNeededToSyncRatio')(deltasNeededToSyncRatio)
+    const swapDeltas = await swap(deltasNeededToSyncRatio)
+
+    const finalState = await logState('finalSate')
+
+    expect(finalState).deep.equal(initialState)
+
+    expect(reduceDeltas([
+      swapDeltas,
+      burnDeltas
+    ])).deep.equal({
+      dX: expandTo18Decimals(3),
+      dY: expandTo18Decimals(120)
+    })
+  })
+
+  // This tests reaches the same state as above but reverting the order
+  // burn and swap.
+  it.only('sync state with swap and burn', async () => {
+    const { initialState, stateAfterAddAndSwap } = await prepStateForSyncWithBurn()
+
+    // swap to reach the initial ratio
+    const deltasNeededToSyncRatio = getDXDYforTargetRatio(initialState.ratio, stateAfterAddAndSwap)
+    logAsString('deltasNeededToSyncRatio')(deltasNeededToSyncRatio)
+    const swapDeltas = await swap(deltasNeededToSyncRatio)
+    const stateAfterSwap = await logState('stateAfterSwap')
+
+    // burn to reach initial totalSupply of liquidity tokens
+    const liquidityToBurn = stateAfterSwap.totalSupply.sub(initialState.totalSupply)
+    logAsString('liquidityToBurn')(liquidityToBurn)
+    const burnDeltas = await burn(liquidityToBurn)
+
+
+    const finalState = await logState('finalSate')
+
+    expect(finalState).deep.equal(initialState)
+
+    expect(reduceDeltas([
+      swapDeltas,
+      burnDeltas
+    ])).deep.equal({
+      dX: expandTo18Decimals(3),
+      dY: expandTo18Decimals(120)
+    })
+  })
+
+  const prepStateForSyncWithMint = async () => {
+    const tokenXAmount = expandTo18Decimals(4)
+    const tokenYAmount = expandTo18Decimals(400)
+
+    await addLiquidity(tokenXAmount, tokenYAmount)
+
+    const initialState = await logState('initialState')
+
+    const burnedLiquidity = expandTo18Decimals(20)
+    await burn(burnedLiquidity)
+
+    const stateAfterBurn = await logState('stateAfterBurn')
+
+    const tokenXAmountSwap = expandTo18Decimals(1)
+    const swapDeltas = await swap({
+      dX: toBNjs(tokenXAmountSwap),
+      dY: getDY(tokenXAmountSwap, stateAfterBurn.reserves)
+    })
+
+    const stateAfterBurnAndSwap = await logState('stateAfterBurnAndSwap')
+
+    return { initialState, stateAfterBurnAndSwap }
+  }
+
+  it.only('sync state with swap and mint', async () => {
+    const { initialState, stateAfterBurnAndSwap } = await prepStateForSyncWithMint()
+
+    // swap to reach the initial ratio
+    const deltasNeededToSyncRatio = getDXDYforTargetRatio(initialState.ratio, stateAfterBurnAndSwap)
+    logAsString('deltasNeededToSyncRatio')(deltasNeededToSyncRatio)
+    const swapDeltas = await swap(deltasNeededToSyncRatio)
+    const stateAfterSwap = await logState('stateAfterSwap')
+
+    // burn to reach initial totalSupply of liquidity tokens
+    const missingTokenXAmount = initialState.reserves.x.sub(stateAfterSwap.reserves.x)
+    logAsString('missingTokenXAmount')(missingTokenXAmount)
+    const addDeltas = await addLiquidityX(missingTokenXAmount, stateAfterSwap)
+
+    const finalState = await logState('finalSate')
+
+    expect(finalState.reserves.x).deep.equal(initialState.reserves.x)
+    // Small rounding errors on following props
+    expect(finalState.reserves.y).deep.equal(initialState.reserves.y.sub(200))
+    expect(finalState.totalSupply).deep.equal(initialState.totalSupply.sub(20))
+    expect(finalState.ratio.decimalPlaces(10)).deep.equal(initialState.ratio.decimalPlaces(10))
+
+    logAsString()(reduceDeltas([
+      swapDeltas,
+      addDeltas
+    ]))
+  })
+
+  // NO test for mint and swap since we don't have an equation which calculates
+  // amounts of pair tokens which need to be deposited to mint desired amount of
+  // liquidity tokens.
+
+  it('sync state', async () => {
+    const tokenXAmount = expandTo18Decimals(2)
+    const tokenYAmount = expandTo18Decimals(200)
+
+    await addLiquidity(tokenXAmount, tokenYAmount)
+
+    const initialState = await logState('initialState')
+
+    // The target state has more tokens and liquidity the current state.
+    // It is a valid state produced by the following swap
+    const targetState = {
+      "ratio": new BNjs('0.0225'),
+      "reserves": {
+        "x": bigNumberify('5000000000000000000'),
+        "y": bigNumberify('222222222222222222222')
+      }
+    }
+
+    // Execute a swap to reach target ratio
+    const initialSwapDeltas = await swap(getDXDYforTargetRatio(targetState.ratio, initialState))
+    logAsString('initialSwapDeltas:')(initialSwapDeltas)
+
+    const stateAfterSwap = await logState('stateAfterSwap')
+
+    const missingTokenXAmount = targetState.reserves.x.sub(stateAfterSwap.reserves.x)
+    logAsString('missingTokenXAmount')(missingTokenXAmount)
+
+    // Add liquidity to reach desired amount of tokens.
+    // addLiquidityX takes amount of X tokens to be deposited and calculates
+    // correct amount ot Y tokens.
+    const addLiquidityDeltas = await addLiquidityX(missingTokenXAmount, stateAfterSwap)
+
+    const targetStateReached = await logState('targetStateReached')
+
+    const burnedLiquidity = (targetStateReached).totalSupply.sub(initialState.totalSupply)
+
+    const burnDeltas = await burn(burnedLiquidity)
+    logAsString('burnDeltas:')(burnDeltas)
+
+    const stateAfterBurn = await logState('stateAfterBurn')
+    const { dX, dY } = getDXDYforTargetRatio(initialState.ratio, stateAfterBurn)
+
+    const finalSwapDeltas = await swap({ dX, dY })
+    logAsString('finalSwapDeltas:')(finalSwapDeltas)
+
+    await logState('finalAmmSate')
+
+    logAsString('final users balance deltas:')(
+      R.reduce(
+        (acc, { dY, dX }) => ({
+          dY: acc.dY.add(dY),
+          dX: acc.dX.add(dX),
+        }),
+        { dY: bigNumberify(0) ,dX: bigNumberify(0) },
+        [
+          initialSwapDeltas,
+          addLiquidityDeltas,
+          burnDeltas,
+          finalSwapDeltas
+        ]
+      )
+    )
+  })
+
   const swapTestCases: BigNumber[][] = [
     [1, 5, 10, '1662497915624478906'],
     [1, 10, 5, '453305446940074565'],
